@@ -1,0 +1,808 @@
+---
+title: "Topic Modelling"
+author: "Umer Naeem"
+date: "25/11/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(quanteda)
+library(topicmodels)
+library(quanteda.textstats)
+library(quanteda.textplots)
+#library(RColorBrewer)
+library(tidyverse)
+library(lubridate)
+library(stm)
+library(zoo)
+library(syuzhet)
+windowsFonts("Arial" = windowsFont("Arial"))
+```
+
+```{r, include=FALSE}
+theme_opm <- function(){ 
+    font <- "Arial"   #assign font family up front
+    
+    theme_minimal() %+replace%    #replace elements we want to change
+    
+    theme(
+      
+      #grid elements
+      panel.grid.major = element_blank(),    #strip major gridlines
+      panel.grid.minor = element_blank(),    #strip minor gridlines
+      panel.background = element_rect(fill = "#dae4ec", color = NA), #background color
+      axis.ticks = element_blank(),          #strip axis ticks
+      strip.background = element_rect(fill = "#ff7025", color = NA),
+      strip.text = element_text(face = "bold", colour = "white", family = font),
+      
+      #since theme_minimal() already strips axis lines, 
+      #we don't need to do that again
+      
+      #text elements
+      plot.title = element_text(             #title
+                   family = font,            #set font family
+                   size = 20,                #set font size
+                   face = 'bold',            #bold typeface
+                   hjust = 0,                #left align
+                   vjust = 2),               #raise slightly
+      
+      plot.subtitle = element_text(          #subtitle
+                   family = font,            #font family
+                   size = 14),               #font size
+      
+      plot.caption = element_text(           #caption
+                   family = font,            #font family
+                   size = 9,                 #font size
+                   hjust = 1),               #right align
+      
+      axis.title = element_text(             #axis titles
+                   family = font,            #font family
+                   size = 10),               #font size
+      
+      axis.title.x = element_blank(),
+      
+      axis.text = element_text(              #axis text
+                   family = font,            #axis famuly
+                   size = 9),                #font size
+      
+      axis.text.x = element_text(            #margin for axis text
+                    angle = 45, vjust = 0.5,
+                    margin=margin(5, b = 10))
+      
+      #since the legend often requires manual tweaking 
+      #based on plot content, don't define it here
+    )
+}
+```
+
+# Introduction
+
+In this, I will try to conduct Topic Modelling using traditional LDA approach. Mostly using `quanteda` and `topicmodels` package. Influenced by this [tutorial](https://github.com/ccs-amsterdam/r-course-material/blob/master/tutorials/r_text_lda.md)
+
+## Step 1: Acquiring data
+```{r, warning=FALSE}
+df <- readxl::read_excel("Data_Processed_without_hash_emoji.xlsx")
+#df <- df %>% remove_rownames %>% column_to_rownames(var="url")
+#distinct(content, .keep_all = TRUE) %>%
+df <- df %>%
+  filter(!is.na(content)) %>%
+  mutate(country_group = ifelse(country_name=="Turkey","Turkey",
+                                ifelse(country_name=="Azerbaijan","Azerbaijan", "Balkans")),
+         before_covid = ifelse(year(published)>=2020, "After COVID", "Before COVID")) %>%
+  remove_rownames %>% column_to_rownames(var="url")
+
+corpus = corpus(df, text_field = "content", meta=list("published", "soruce", "country_name"))
+```
+
+# Step 1A: Data Exploration
+```{r, warning=FALSE, fig.width=9}
+glimpse(df)
+
+# By country Name
+df %>%
+  group_by(country_name) %>%
+  count()
+
+# By country Group
+df %>%
+  group_by(country_group) %>%
+  count()
+
+df %>%
+  group_by(source, country_group) %>%
+  count() %>%
+  pivot_wider(names_from = country_group, values_from = n)
+
+df %>%
+  group_by(country_group, source) %>%
+  summarise(count = n()) %>%
+  ungroup() %>%
+  group_by(country_group) %>%
+  mutate(countT = sum(count)) %>%
+  ungroup() %>%
+  mutate(pct = round((count/countT)*100,1)) %>%
+  ggplot(aes(x=country_group, y=pct, fill=source)) +
+geom_bar(stat="identity", position=position_dodge()) +
+    geom_text(
+    aes(
+      label = pct,
+      family = "Arial",
+    ),
+    vjust=-0.3,
+    position = position_dodge(0.9),
+    size = 2.7
+  ) +
+  theme_opm()
+  
+
+df %>%
+  mutate(date = date(published),
+         monthyr = as.Date(as.yearmon(format(date(df$published), "%Y-%m")))) %>%
+  group_by(date, source) %>%
+  mutate(total = n()) %>%
+  ggplot(aes(x = date, y = total)) +
+  geom_area(aes(fill = source), 
+          alpha = 0.5, position = position_dodge(0.8)) +
+  scale_color_manual(values = c("#00AFBB", "#E7B800", "#072263", "#DAF7A6", "#C70039", "#2C4954")) +
+  scale_fill_manual(values = c("#00AFBB", "#E7B800", "#072263", "#DAF7A6", "#C70039", "#2C4954")) +
+  scale_x_date(date_breaks = "2 month", date_labels = "%b/%Y") +
+  labs(x = "Date", y="Results per day", fill="Source") + 
+  theme_opm()
+
+#plotly::ggplotly(time_g)
+```
+
+## Analysing by time
+Below, I am analyzing times where there was a sudden rise in the total number of mentions. 
+
+First, I am aggregating total number of mentions by three months. Out of those, I am taking the top 3 groups with the highest number of mentions. Turns out that the top 3 quarters where we had the most number of mentions are
+1. Quarter starting from Feb 2021
+2. Quarter starting from Aug 2020
+3. Quarter starting from Feb 2020
+
+```{r, warning=FALSE, fig.width=9}
+monthyr1 <- df %>%
+  mutate(monthyr = as.Date(as.yearmon(format(date(df$published), "%Y-%m")))) %>%
+  group_by(monthyr) %>%
+  summarise(per_month = n()) %>%
+  ungroup() %>%
+  group_by(group = rep(row_number(), each=3, length.out = n())) %>% 
+  mutate(segment_total = sum(per_month, na.rm = TRUE)) %>% 
+  ungroup() %>%
+  arrange(desc(segment_total)) %>%
+  head(9) %>%
+  pull(monthyr)
+
+# Making a smaller dataset
+df1 <- df %>%
+  mutate(date = date(published),
+         monthyr = as.Date(as.yearmon(format(date(df$published), "%Y-%m")))) %>%
+  filter(monthyr %in% monthyr1)
+
+df %>%
+  mutate(date = date(published),
+         monthyr = as.Date(as.yearmon(format(date(df$published), "%Y-%m")))) %>%
+  filter(monthyr %in% monthyr1) %>%
+  group_by(date, source) %>%
+  mutate(total = n()) %>%
+  ggplot(aes(x = date, y = total)) +
+  geom_area(aes(color = source, fill = source), 
+          alpha = 0.5, position = position_dodge(0.8)) +
+  scale_color_manual(values = c("#00AFBB", "#E7B800", "#072263", "#DAF7A6", "#C70039", "#2C4954")) +
+  scale_fill_manual(values = c("#00AFBB", "#E7B800", "#072263", "#DAF7A6", "#C70039", "#2C4954")) +
+  scale_x_date(date_breaks = "3 month", date_labels = "%b/%Y") +
+  theme_opm()
+```
+
+Now we'll make wordclouds to see within these groups
+
+```{r, warning=FALSE}
+# Wordcloud for comparison purposes
+df1 <- df1 %>%
+  mutate(
+    group_var = case_when(
+    monthyr == "2021-02-01" | monthyr == "2021-03-01" | monthyr == "2021-04-01" ~ "Group 1",
+    monthyr == "2020-08-01" | monthyr == "2020-09-01" | monthyr == "2020-10-01" ~ "Group 2",
+    monthyr == "2020-02-01" | monthyr == "2020-03-01" | monthyr == "2020-04-01" ~ "Group 3"
+  )
+  ) %>%
+  group_by(group_var) %>%
+  mutate(total_mentions = n()) %>%
+  select(monthyr, group_var, total_mentions, content)
+
+# Making corpus
+df1_corpus <- corpus(df1, text_field = "content")
+```
+
+### All 3 groups
+```{r, warning=FALSE}
+set.seed(1234)
+toks <- df1_corpus %>%
+  tokens() %>%
+  dfm %>%
+  dfm_group(groups = group_var) %>%
+  dfm_trim(min_termfreq = 3, verbose = FALSE) %>%
+  textplot_wordcloud(comparison = TRUE)
+
+toks <- df1_corpus %>%
+  tokens()
+
+dfm1 <- dfm(toks) %>%
+  dfm_trim(min_termfreq = 3)
+  
+fcm1 <- fcm(toks, context = "window")
+feat <- names(topfeatures(fcm1, 50))
+fcm2 <- fcm_select(fcm1, pattern = feat)
+textplot_network(fcm2, min_freq = 0.8)
+```
+
+### Group 1
+```{r, warning=FALSE}
+toks <- df1_corpus %>%
+  corpus_subset(group_var == "Group 1") %>%
+  tokens()
+
+dfm1 <- dfm(toks) %>%
+  dfm_trim(min_termfreq = 3)
+  
+set.seed(123)
+wordC <- textplot_wordcloud(dfm1, rotation = 0.25, 
+                   color = rev(RColorBrewer::brewer.pal(10, "RdBu")))
+  
+fcm1 <- fcm(toks, context = "window")
+feat <- names(topfeatures(fcm1, 50))
+fcm2 <- fcm_select(fcm1, pattern = feat)
+textplot_network(fcm2, min_freq = 0.8)
+```
+
+### Group 2
+```{r,warning=FALSE}
+toks <- df1_corpus %>%
+  corpus_subset(group_var == "Group 2") %>%
+  tokens()
+
+dfm1 <- dfm(toks) %>%
+  dfm_trim(min_termfreq = 3)
+  
+set.seed(123)
+wordC <- textplot_wordcloud(dfm1, rotation = 0.25, 
+                   color = rev(RColorBrewer::brewer.pal(10, "RdBu")))
+  
+fcm1 <- fcm(toks, context = "window")
+feat <- names(topfeatures(fcm1, 50))
+fcm2 <- fcm_select(fcm1, pattern = feat)
+textplot_network(fcm2, min_freq = 0.8)
+```
+
+### Group 3
+```{r,warning=FALSE}
+toks <- df1_corpus %>%
+  corpus_subset(group_var == "Group 3") %>%
+  tokens()
+
+dfm1 <- dfm(toks) %>%
+  dfm_trim(min_termfreq = 3)
+  
+set.seed(123)
+wordC <- textplot_wordcloud(dfm1, rotation = 0.25, 
+                   color = rev(RColorBrewer::brewer.pal(10, "RdBu")))
+  
+fcm1 <- fcm(toks, context = "window")
+feat <- names(topfeatures(fcm1, 50))
+fcm2 <- fcm_select(fcm1, pattern = feat)
+textplot_network(fcm2, min_freq = 0.8)
+```
+
+## Step 1B: Exploring Authors
+We have decided to use the power of Talk Walker to run the analysis on Influencers.
+
+![Image 1: Most Active Influencers](./education/image1_influencers.png)
+
+![Image 2: Most Active Influencers - Twitter](./education/influencers_twitter.png)
+
+![Image 3: Most Active Influencers - Online News](./education/influencers_news.png)
+
+![Image 4: Most Active Influencers - Positve Sentiment](./education/influencers_positive.png)
+
+![Image 5: Most Active Influencers - Negative Sentiment](./education/influencers_negative.png)
+## Step 2: Creating document-frequency matrix
+
+```{r,warning=FALSE}
+dfm <- corpus %>%
+  tokens() %>%
+  dfm() %>%
+  dfm_trim(min_termfreq = 5, verbose = FALSE)
+```
+
+### Frequency plots
+
+This is a general frequency plot.
+```{r, warning=FALSE, fig.width=9}
+freq <- textstat_frequency(dfm, n = 50)
+
+# Sort by reverse frequency order
+freq$feature <- with(freq, reorder(feature, -frequency))
+
+ggplot(freq, aes(x = feature, y = frequency)) +
+    geom_point() +
+    theme_opm() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+By country group
+
+```{r, warning=FALSE, fig.width=9}
+dfm_prop <- dfm %>%
+  dfm_group(groups=dfm$country_group) %>%
+  dfm_weight(scheme = "prop")*100
+
+# Calculate relative frequency by country_group
+freq_weight <- textstat_frequency(dfm_prop, n = 10, 
+                                  groups = dfm_prop$country_group)
+
+ggplot(data = freq_weight, aes(x = nrow(freq_weight):1, y = frequency)) +
+     geom_point() +
+     facet_wrap(~ group, scales = "free") +
+     coord_flip() +
+     scale_x_continuous(breaks = nrow(freq_weight):1,
+                        labels = freq_weight$feature) +
+     labs(x = NULL, y = "Relative frequency") +
+  theme_opm()
+```
+
+### Keyness Plot
+
+```{r, warning=FALSE, fig.width=9}
+dfm_covid <- tokens(corpus) %>%
+  tokens_group(groups = before_covid) %>%
+  dfm()
+tstat_key <- textstat_keyness(dfm_covid, 
+                              target = "After COVID")
+textplot_keyness(tstat_key) + theme_opm()
+```
+
+### Network Plot of Hash Tags
+
+```{r, eval=FALSE}
+tag_dfm <- dfm_select(dfm, pattern = "#*")
+#tag_dfm <- dfm_select(dfm)
+toptag <- names(topfeatures(tag_dfm, 50))
+
+fcm_d <- fcm(tag_dfm)
+
+fcm_small <- fcm_select(fcm_d, pattern = toptag)
+textplot_network(fcm_small, min_freq = 0.1, edge_alpha = 0.8, edge_size = 5)
+```
+
+## Extract posts related to hashtags
+
+In here we can add any hashtag or any word, and the posts related to that will appear
+```{r, eval=FALSE}
+toks <- tokens(corpus)
+kwic(toks, pattern = "#artsakh", valuetype = "fixed")
+```
+
+# Step 3: Topic Modelling
+
+In here, I am asking the algorithm to give me 6 topics. 
+```{r, warning=FALSE}
+dtm = convert(dfm, to = "topicmodels") 
+set.seed(145)
+m = LDA(dtm, method = "Gibbs", k = 6,  control = list(alpha = 0.1))
+```
+
+## Step 4: Inspecting topics
+
+Top 10 terms from all 6 topics.
+
+```{r, warning=FALSE}
+as_tibble(terms(m,10))
+```
+
+### Inspecting terms
+We will want to answer the questions __"How many words are most important for a topic?"__
+
+The plot below will show how many words can cover **60%** of a topic.
+
+```{r, echo=FALSE, fig.width=9}
+# Creating topic words and their probability values dataset
+terms_d <- as.data.frame(t(posterior(m)$terms))
+colnames(terms_d) <- c("topic1", "topic2", "topic3", "topic4", "topic5", "topic6")
+terms_d <- terms_d*100
+
+## Cumulative sum
+TopicTerms <- function(topicID, pct) {
+  topic = paste0("topic",topicID)
+  terms_d %>%
+  select(!!sym(topic)) %>%
+  rownames_to_column(var = "terms") %>%
+  arrange(desc(!!sym(topic))) %>%
+  mutate(cumulative = cumsum(!!sym(topic))) %>%
+  filter(cumulative <= pct) %>%
+  count()
+}
+
+TopicTerms1 <- function(topicID, pct) {
+  topic = paste0("topic",topicID)
+  terms_d %>%
+  select(!!sym(topic)) %>%
+  rownames_to_column(var = "terms") %>%
+  arrange(desc(!!sym(topic))) %>%
+  mutate(cumulative = cumsum(!!sym(topic))) %>%
+  filter(cumulative <= pct)
+}
+
+# Sentiment plots
+sentiment_plot <- function(topicID) {
+  s_v <- get_sentiment(TopicTerms1(topicID,60)[["terms"]])
+  s_v = data.frame(s_v)
+  s_v$ID <- seq.int(nrow(s_v))
+  if (nrow(s_v) <= 80) {
+    breaks = seq(0,nrow(s_v),5)
+  } else {
+    breaks = seq(0,nrow(s_v),20)
+  }
+  s_v %>%
+    ggplot(aes(ID,s_v, group=1)) +
+    geom_line() +
+    geom_smooth() +
+    scale_x_continuous(
+      breaks = breaks
+    ) +
+    geom_hline(yintercept = 0, color = "red") +
+    theme_opm()
+}
+
+sent1 <- sentiment_plot(1)
+sent2 <- sentiment_plot(2)
+sent3 <- sentiment_plot(3)
+sent4 <- sentiment_plot(4)
+sent5 <- sentiment_plot(5)
+sent6 <- sentiment_plot(6)
+
+cowplot::plot_grid(sent1, sent2, sent3, sent4, sent5, sent6, labels = c("Topic 1", "Topic 2", "Topic 3", "Topic 4", "Topic 5", "Topic 6"), hjust = -1)
+
+## Producing a plot
+out <- matrix(ncol = 1, nrow=6)
+for (topics in 1:6) {
+  out[topics,] <- TopicTerms(topics, 60)[["n"]]
+}
+
+out <-data.frame(out)
+out %>%
+  rowid_to_column("Topic") %>%
+  mutate(Topic = paste("Topic", Topic)) %>%
+  ggplot(aes(x=Topic, y=out)) +
+  geom_bar(stat = "identity", fill = "#0b1f51") +
+    geom_text(
+    aes(
+      label = out,
+      vjust = -0.5,
+      family = "Arial"
+    ),
+    size = 2.7
+  ) +
+  ylab("Number of words") +
+  theme_opm()
+```
+
+## Sentiment by Topic
+We'll find sentiment by top words which make **60%** of the topic
+
+```{r, echo=FALSE, fig.width=9}
+Terms60 <- function(topicID) {
+  topic = paste0("topic",topicID)
+  terms_d %>%
+  select(!!sym(topic)) %>%
+  rownames_to_column(var = "terms") %>%
+  arrange(desc(!!sym(topic))) %>%
+  mutate(cumulative = cumsum(!!sym(topic))) %>%
+  filter(cumulative <= 60) %>%
+  select(terms)
+}
+
+## Producing a plot
+out <- matrix(ncol = 1, nrow=6)
+for (topics in 1:6) {
+  out[topics,] <- sum(get_sentiment(Terms60(topics)[["terms"]], method = "syuzhet"))
+}
+
+out <-data.frame(out)
+out %>%
+  rowid_to_column("Topic") %>%
+  mutate(Topic = paste("Topic", Topic)) %>%
+  ggplot(aes(x=Topic, y=out)) +
+  geom_bar(stat = "identity", fill = "#0b1f51") +
+    geom_text(
+    aes(
+      label = round(out,2),
+      vjust = -0.5,
+      family = "Arial"
+    ),
+    size = 2.7
+  ) +
+  labs(
+    caption = "Greater than zero implies a positive sentiment"
+  ) +
+  ylab("Sentiment") +
+  theme_opm()
+```
+
+#### NRC Sentiment Analysis
+The ```get_nrc_sentiment``` implements Saif Mohammad’s NRC Emotion lexicon. According to Mohammad, “the NRC emotion lexicon is a list of words and their associations with eight emotions (anger, fear, anticipation, trust, surprise, sadness, joy, and disgust) and two sentiments (negative and positive)” [LINK](http://saifmohammad.com/WebPages/NRC-Emotion-Lexicon.htm).
+
+```{r, echo=FALSE, fig.width=9}
+nrc_data1 = get_nrc_sentiment(Terms60(1)[["terms"]])
+nrc_data2 = get_nrc_sentiment(Terms60(2)[["terms"]])
+nrc_data3 = get_nrc_sentiment(Terms60(3)[["terms"]])
+nrc_data4 = get_nrc_sentiment(Terms60(4)[["terms"]])
+nrc_data5 = get_nrc_sentiment(Terms60(5)[["terms"]])
+nrc_data6 = get_nrc_sentiment(Terms60(6)[["terms"]])
+
+# https://stackoverflow.com/questions/16816032/convert-named-character-vector-to-data-frame
+nrc_d1 <- data.frame(keyName=names(sort(colSums(prop.table(nrc_data1)))), value=sort(colSums(prop.table(nrc_data1))), topic = "Topic1", row.names=NULL)
+nrc_d2 <- data.frame(keyName=names(sort(colSums(prop.table(nrc_data2)))), value=sort(colSums(prop.table(nrc_data2))), topic = "Topic2", row.names=NULL)
+nrc_d3 <- data.frame(keyName=names(sort(colSums(prop.table(nrc_data3)))), value=sort(colSums(prop.table(nrc_data3))), topic = "Topic3", row.names=NULL)
+nrc_d4 <- data.frame(keyName=names(sort(colSums(prop.table(nrc_data4)))), value=sort(colSums(prop.table(nrc_data4))), topic = "Topic4", row.names=NULL)
+nrc_d5 <- data.frame(keyName=names(sort(colSums(prop.table(nrc_data5)))), value=sort(colSums(prop.table(nrc_data5))), topic = "Topic5", row.names=NULL)
+nrc_d6 <- data.frame(keyName=names(sort(colSums(prop.table(nrc_data6)))), value=sort(colSums(prop.table(nrc_data6))), topic = "Topic6", row.names=NULL)
+
+
+nrc_d <- rbind(nrc_d1, nrc_d2, nrc_d3, nrc_d4, nrc_d5, nrc_d6)
+
+nrc_d %>%
+  ggplot(aes(x=keyName, y=value)) +
+  geom_bar(stat = "identity", fill = "#0b1f51") +
+    geom_text(
+    aes(
+      label = round(value,2),
+      vjust = -0.5,
+      family = "Arial"
+    ),
+    size = 2.7
+  ) +
+  facet_wrap(~topic) +
+  theme_opm()
+
+```
+
+### Wordclouds
+
+Lets analyse what is happening in _Topic 5_. We will use the `posterior` function.
+
+```{r, warning=FALSE}
+word_c <- function(topic_id) {
+  topic = topic_id
+  words = posterior(m)$terms[topic, ]
+  topwords = sort(words, decreasing = T)
+  wordcloud(words = names(topwords), freq = topwords, min.freq = 1,
+            max.words=200, random.order=FALSE, rot.per=0.35, 
+            colors=brewer.pal(8, "Dark2"))
+}
+```
+
+Creating a **wordcloud** of terms in `Topic = 5`
+
+```{r, warning=FALSE}
+library(wordcloud)
+set.seed(1234)
+word_c(5)
+```
+
+I have to create a doc level dataframe with topics against each doc
+
+```{r}
+df1 <- merge(df, as.data.frame(posterior(m)$topics), by="row.names", all = TRUE)
+rownames(df1) = df1$Row.names
+df1<- df1 %>%
+  select(published, source, country_name, country_group, raw_content, "1":"6") %>%
+  rename(
+    Topic1 = "1", Topic2 = "2", Topic3 = "3", Topic4 = "4", Topic5 = "5", Topic6 = "6"
+  )
+```
+
+
+### Posts related to topics
+
+```{r}
+df1 %>%
+  arrange(desc(Topic6)) %>%
+  select(raw_content, Topic6) %>%
+  head(2)
+```
+
+## Step 5: Creating Plots
+
+### Most prevalent topics
+
+To show which topic is most prevalent in all documents
+
+```{r, warning=FALSE, fig.width=9}
+df1 %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm=TRUE))) %>%
+  pivot_longer(everything(), names_to = "Topics", values_to = "Proportion") %>%
+  ggplot(aes(x = Topics, y = Proportion)) +
+  geom_bar(stat = "identity", fill = "#0b1f51") +
+  geom_text(
+    aes(
+      label = paste0(round(Proportion*100,2),"%"),
+      vjust = -0.5,
+      family = "Arial"
+    ),
+    size = 2.7
+  ) +
+  labs(
+    x = "Topics",
+    y = "Proportion",
+    title = "Proportion of topics in overall data"
+  ) +
+  theme_opm()
+```
+
+### Most prevalent topics by countries
+From the graph, it looks like **Topic 2** was mostly discussed in *Central Asian Countries* while **Topic 1** was mostly discussed in Turkey.
+
+```{r, warning=FALSE, fig.width=9}
+df1 %>%
+  group_by(country_group) %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm=TRUE))) %>%
+  pivot_longer(!country_group, names_to = "Topics", values_to = "Proportion") %>%
+  ggplot(aes(x = Topics, y = Proportion)) +
+  geom_bar(stat = "identity", fill = "#0b1f51") +
+  facet_wrap(~country_group) +
+  geom_text(
+    aes(
+      label = paste0(round(Proportion*100,2),"%"),
+      vjust = -0.5,
+      family = "Arial"
+    ),
+    size = 2.7
+  ) +
+  theme_opm()
+```
+
+### Time series of topics
+
+Now I want to see how the topics vary with time. Here, I will aggregate the topics by month and see how the trend looks like.
+
+```{r, warning=FALSE, fig.width=9}
+df1 %>%
+  select(published, Topic1:Topic6) %>%
+  mutate(monthyr = as.Date(as.yearmon(format(date(df1$published), "%Y-%m")))) %>%
+  pivot_longer(starts_with("Topic"), names_to = "Topics", values_to = "Proportion") %>%
+  group_by(monthyr, Topics) %>%
+  summarise(Avg = mean(Proportion, na.rm=T)) %>%
+  ggplot() +
+    geom_point(aes(x=monthyr,y=Avg)) +
+    geom_smooth(aes(x=monthyr,y=Avg)) +
+  facet_wrap(~ Topics) +
+  theme_opm()
+  
+```
+
+```{r, warning=FALSE, fig.width=10, eval=FALSE, echo=FALSE}
+df1 %>%
+  select(published, Topic1:Topic5) %>%
+  mutate(monthyr = as.Date(as.yearmon(format(date(df1$published), "%Y-%m")))) %>%
+  pivot_longer(starts_with("Topic"), names_to = "Topics", values_to = "Proportion") %>%
+  group_by(monthyr, Topics) %>%
+  summarise(Avg = mean(Proportion, na.rm=T)) %>%
+  ggplot(aes(x = monthyr, y = Avg)) +
+    geom_line(aes(color = Topics), size = 1) +
+    scale_color_manual(values = c("#00AFBB", "#E7B800", "#072263", "#DAF7A6", "#C70039", "#2C4954", "#CADF74")) +
+  scale_x_date(date_breaks = "3 month", date_labels = "%b/%Y") +
+  theme_opm()
+
+
+#### By Countries
+df1 %>%
+  select(published, country_group, Topic1:Topic5) %>%
+  mutate(monthyr = as.Date(as.yearmon(format(date(df1$published), "%Y-%m")))) %>%
+  pivot_longer(starts_with("Topic"), names_to = "Topics", values_to = "Proportion") %>%
+  group_by(country_group, monthyr, Topics) %>%
+  summarise(Avg_Proportion = mean(Proportion, na.rm=T)) %>%
+  ggplot(aes(x = monthyr, y = Avg_Proportion)) +
+    geom_line(aes(color = Topics), size = 1) +
+  facet_wrap(~country_group) +
+    scale_color_manual(values = c("#00AFBB", "#E7B800", "#072263", "#DAF7A6", "#C70039", "#2C4954", "#CADF74")) +
+  scale_x_date(date_breaks = "3 month", date_labels = "%b/%Y") +
+  theme_opm()
+```
+
+### Correlation Plot of Topics
+In here, the objective is to try to find correlation of different topics. 
+
+This is not producing very good results
+```{r, eval=FALSE, echo=FALSE}
+source("http://www.sthda.com/upload/rquery_cormat.r")
+require(corrplot)
+
+df1 %>%
+  select(Topic1:Topic6) %>%
+  rquery.cormat()
+
+df1 %>%
+  filter(country_group=="Turkey") %>%
+  select(Topic1:Topic6) %>%
+  rquery.cormat()
+
+df1 %>%
+  filter(country_group=="Azerbaijan") %>%
+  select(Topic1:Topic6) %>%
+  rquery.cormat()
+
+df1 %>%
+  filter(country_group=="Balkans") %>%
+  select(Topic1:Topic6) %>%
+  rquery.cormat()
+```
+
+### Heat Map
+
+```{r, fig.width=9}
+## Country Names
+docs = docvars(dfm)[match(rownames(dtm), docnames(dfm)),]
+
+## Country Groups
+tpp = aggregate(posterior(m)$topics, by=docs["country_group"], mean)
+rownames(tpp) = tpp$country_group
+heatmap(as.matrix(tpp[-1]), Colv = FALSE)
+```
+
+### Pre-post COVID
+
+I will consider COVID time as start of 2020
+
+```{r, warning=FALSE, fig.width=9}
+df1 %>%
+  mutate(before_covid = ifelse(year(published) >= 2020, "After COVID", "Before COVID")) %>%
+  group_by(before_covid) %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm=TRUE))) %>%
+  pivot_longer(!before_covid, names_to = "Topics", values_to = "Proportion") %>%
+  ggplot(aes(x = Topics, y = Proportion)) +
+  geom_bar(stat = "identity", fill = "#0b1f51") +
+  facet_wrap(~before_covid) +
+  geom_text(
+    aes(
+      label = paste0(round(Proportion*100,2),"%"),
+      vjust = -0.5,
+      family = "Arial"
+    ),
+    size = 2.7
+  ) +
+  theme_opm()
+
+df1 %>%
+  mutate(before_covid = ifelse(year(published) >= 2020, "After COVID", "Before COVID")) %>%
+  group_by(country_group, before_covid) %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm=TRUE))) %>%
+  pivot_longer(starts_with("Topic"), names_to = "Topics", values_to = "Proportion") %>%
+  ggplot(aes(x = Topics, y = Proportion)) +
+  geom_bar(stat = "identity", fill = "#0b1f51") +
+  facet_wrap(country_group~before_covid) +
+  geom_text(
+    aes(
+      label = paste0(round(Proportion*100,2),"%"),
+      vjust = -0.5,
+      family = "Arial"
+    ),
+    size = 2.7
+  ) +
+  theme_opm()
+```
+
+```{r, eval=FALSE, echo=FALSE}
+library(LDAvis)   
+#library(servr)
+dtm = dtm[slam::row_sums(dtm) > 0, ]
+phi = as.matrix(posterior(m)$terms)
+theta <- as.matrix(posterior(m)$topics)
+vocab <- colnames(phi)
+doc.length = slam::row_sums(dtm)
+term.freq = slam::col_sums(dtm)[match(vocab, colnames(dtm))]
+
+json = createJSON(phi = phi, theta = theta, vocab = vocab,
+     doc.length = doc.length, term.frequency = term.freq)
+serVis(json)
+```
